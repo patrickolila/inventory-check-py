@@ -95,8 +95,12 @@ st.set_page_config(page_title="Inventory Agent", page_icon="🕵️‍♂️", l
 st.title("🕵️‍♂️ Inventory Agent")
 st.markdown("Upload your daily sheets below to run the audit.")
 
-# Secure API Key Input
-api_key = st.text_input("Enter your Gemini API Key", type="password")
+# Automatically grab the API key from Streamlit's hidden vault
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+else:
+    # Fallback just in case the vault is empty
+    api_key = st.text_input("Enter your Gemini API Key", type="password")
 
 col1, col2 = st.columns(2)
 with col1:
