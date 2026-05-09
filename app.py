@@ -201,7 +201,8 @@ def run_openai(expected_path, cropped_path):
         })
 
     response = client.chat.completions.create(
-        model="gpt-5.5",
+        model="gpt-4o",
+        max_tokens=4000,
         response_format={"type": "json_object"},
         messages=[{"role": "user", "content": content}],
     )
@@ -338,7 +339,7 @@ def ensemble_audit(expected_path, cropped_path):
 # ---------- STREAMLIT USER INTERFACE ----------
 st.set_page_config(page_title="Inventory Agent Pro", page_icon="🕵️‍♂️", layout="centered")
 st.title("🕵️‍♂️ Inventory Agent Pro")
-st.markdown("Powered by Multi-Model Consensus (Gemini + GPT-5.5 + Claude)")
+st.markdown("Powered by Multi-Model Consensus (Gemini + GPT-4o + Claude)")
 
 if not GEMINI_API_KEY or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
     st.error("⚠️ Missing API Keys! Please configure Streamlit Secrets.")
@@ -378,7 +379,7 @@ if st.button("Run Consensus Audit", type="primary"):
                 st.info(f"Step 2: Cropping column for {target_date}...")
                 apply_precision_crop(act_path, crop_path, col_info)
 
-                st.info("Step 3: Querying Gemini, GPT-5.5, and Claude in parallel...")
+                st.info("Step 3: Querying Gemini, GPT-4o, and Claude in parallel...")
                 result = ensemble_audit(exp_path, crop_path)
 
             # Always surface per-model status so silent failures aren't invisible
