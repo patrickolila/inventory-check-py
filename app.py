@@ -139,7 +139,7 @@ def run_claude(expected_path, cropped_path, prompt):
             content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
             
         response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-opus-4-7",
             max_tokens=2000,
             messages=[{"role": "user", "content": content}]
         )
