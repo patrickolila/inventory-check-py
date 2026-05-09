@@ -237,7 +237,11 @@ def locate_target_column(client, expected_path: str, actual_path: str):
 def apply_precision_crop(input_pdf_path: str, output_pdf_path: str, col_info: dict):
     names_end = col_info.get("names_end_line", 22) / 100.0
     center = col_info.get("target_col_center_line", 74) / 100.0
-    target_start, target_end = center - 0.04, center + 0.04
+    # Wider window for narrower columns. With an 8-day sheet, each column is
+    # ~8% of page width — a 12% window (6% each side) gives skew tolerance
+    # while still excluding adjacent columns. With a 10-day sheet use 0.05.
+    # With a 14-day sheet (very narrow columns) use 0.03.
+    target_start, target_end = center - 0.06, center + 0.06
 
     src_doc = fitz.open(input_pdf_path)
     out_doc = fitz.open()
