@@ -220,7 +220,21 @@ def locate_target_column(client, expected_path: str, actual_path: str):
     img_bytes = page.get_pixmap(dpi=150).tobytes("png")
     doc.close()
 
-    prompt = """You are an expert inventory surveyor. Look at the attached ACTUAL inventory sheet image. Read the target date from the EXPECTED PDF. Find that date in the ACTUAL sheet. Tell me the exact Red Line number (0-100) running through the CENTER of that date's column. Tell me the Red Line number where the Item Names column ends. Respond ONLY in JSON: {"target_date": "YYYY-MM-DD", "expected_header": "string", "names_end_line": 22, "target_col_center_line": 74}"""
+    prompt = """You are an expert inventory surveyor. Look at the attached ACTUAL inventory sheet image.
+
+Read the target date from the EXPECTED PDF. The day-of-month from that date (e.g. "7" for May 7) is what you need to find on the actual sheet.
+
+The actual sheet has TWO header rows at the top:
+- Row 1 (printed): "PACK:" then "DATE DATE DATE DATE DATE DATE DATE DATE"
+- Row 2 (handwritten): the actual day numbers, e.g. "7  8  9  10  11  12  13  14"
+
+Look at ROW 2 (the handwritten day numbers). Find the cell containing the target day. Report:
+- The Red Line number (0-100) running through the CENTER of that cell's column.
+- The Red Line number where the Item Names column ends (i.e. where the data columns begin).
+
+If the day numbers are missing or unreadable, say so in the note field.
+
+Respond ONLY in JSON: {"target_date": "YYYY-MM-DD", "expected_header": "string (the day number you found, e.g. '7')", "names_end_line": 22, "target_col_center_line": 74, "note": ""}"""
 
     with open(expected_path, "rb") as f:
         exp_bytes = f.read()
