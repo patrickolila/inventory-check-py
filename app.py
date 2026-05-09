@@ -6,6 +6,7 @@ import base64
 import re
 import traceback
 import concurrent.futures
+import time
 from collections import Counter
 import fitz  # PyMuPDF
 from pypdf import PdfReader
@@ -14,20 +15,27 @@ from google.genai import types
 import openai
 import anthropic
 
-# ---------- API Keys (Pulled directly from Streamlit Secrets) ----------
+# ============================================================================
+# Config
+# ============================================================================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
-# ---------- Per-model timeout for one API call ----------
 MODEL_TIMEOUT_SECONDS = 180
+
+# Crop window — half-width on each side of the column center.
+# Tune this for your sheet layout:
+#   8-day  portrait sheet -> 0.06 (12% wide window, each col is ~8.75%)
+#   10-day landscape sheet -> 0.05 (10% wide, each col is ~7%)
+#   14-day landscape sheet -> 0.03 (6% wide, each col is ~5.7%)
+CROP_HALF_WIDTH = 0.06
 
 
 # ============================================================================
 # JSON / type helpers
 # ============================================================================
 def safe_parse_json(text: str) -> dict:
-    """Parse JSON from a model response with light cleanup. Returns {} on failure."""
     if not text:
         return {}
     raw = text.strip()
@@ -88,32 +96,8 @@ def pdf_to_base64_images(pdf_path: str):
 
 # ============================================================================
 # Expected PDF text extraction
-# ----------------------------------------------------------------------------
-# The expected PDF is typed Excel output, so pypdf can pull names and numbers
-# directly. We parse line-by-line: most data lines look like "Item Name 5"
-# (name then quantity). Section headers are ALL CAPS phrases without numbers.
-# This avoids having to send 8 PDF pages as images to every model — saves
-# tokens, and structured text is easier for models to reason over than images
-# of a typed list.
 # ============================================================================
 def extract_expected_items(pdf_path: str):
-    """Parse the typed expected PDF.
-
-    The typed master sheet uses a trailing capital 'O' as a section-header
-    legend marker. Headers either end in ' O' (with a space) or 'O' attached
-    directly after a letter or close-paren (e.g. 'BARO', ')O', '4.00GO').
-    Item lines end in a digit (the quantity), with or without a separating
-    space (pypdf occasionally drops the space, producing 'Pink Violator20').
-
-    Strategy:
-      1. Skip noise lines: TEMP markers, dated freeform notes, *(...) annotations.
-      2. If line is a section header (legend marker), update current category.
-      3. Otherwise, pull the trailing digit run as the quantity, the rest as name.
-
-    Returns (items, header_text) where:
-       items = [{"name": str, "qty": int, "category": str}, ...]
-       header_text = first non-empty line, usually contains the date.
-    """
     reader = PdfReader(pdf_path)
     raw_lines = []
     for page in reader.pages:
@@ -149,13 +133,10 @@ def extract_expected_items(pdf_path: str):
             return True
         if s.endswith("O") and len(s) >= 2:
             prev = s[-2]
-            # Header marker if previous char is alpha (uppercase, since "o" lowercase
-            # would be part of a word) or close-paren. Digits before O would be ambiguous.
             if prev.isalpha() and prev != "o":
                 return True
             if prev == ")":
                 return True
-        # Known bare ALL-CAPS headers that lack the legend marker
         if s in ("BUUDA 100MG", "KITS"):
             return True
         return False
@@ -188,7 +169,6 @@ def extract_expected_items(pdf_path: str):
 
 
 def format_expected_for_prompt(items):
-    """Format the expected items as a clean text block for the prompt."""
     if not items:
         return "(no expected items extracted)"
     lines = []
@@ -206,7 +186,6 @@ def format_expected_for_prompt(items):
 # Surveyor + Crop
 # ============================================================================
 def locate_target_column(client, expected_path: str, actual_path: str):
-    """Page 1 only — saves cost vs the old 3-page version."""
     doc = fitz.open(actual_path)
     if len(doc) == 0:
         doc.close()
@@ -220,21 +199,37 @@ def locate_target_column(client, expected_path: str, actual_path: str):
     img_bytes = page.get_pixmap(dpi=150).tobytes("png")
     doc.close()
 
-    prompt = """You are an expert inventory surveyor. Look at the attached ACTUAL inventory sheet image.
+    prompt = """You are an expert inventory surveyor analyzing a multi-day inventory pack sheet.
 
-Read the target date from the EXPECTED PDF. The day-of-month from that date (e.g. "7" for May 7) is what you need to find on the actual sheet.
+The sheet has TWO header rows at the top:
+- Row 1 (printed): "PACK:" then "DATE  DATE  DATE  DATE  DATE  DATE  DATE  DATE" (or similar)
+- Row 2 (handwritten): the actual day-of-month numbers, e.g. "7  8  9  10  11  12  13  14"
 
-The actual sheet has TWO header rows at the top:
-- Row 1 (printed): "PACK:" then "DATE DATE DATE DATE DATE DATE DATE DATE"
-- Row 2 (handwritten): the actual day numbers, e.g. "7  8  9  10  11  12  13  14"
+You will receive an image with vertical RED LINES drawn every 2 units from 0 to 100. Each red line is implicitly numbered by its position.
 
-Look at ROW 2 (the handwritten day numbers). Find the cell containing the target day. Report:
-- The Red Line number (0-100) running through the CENTER of that cell's column.
-- The Red Line number where the Item Names column ends (i.e. where the data columns begin).
+Your job:
+1. Read the target date from the EXPECTED PDF — extract the day-of-month (e.g. for "MAY 7 2026" the day is "7").
+2. Look at ROW 2 of the actual sheet's header (the HANDWRITTEN day numbers, NOT the printed "DATE" labels). Find the cell containing the target day.
+3. Determine the Red Line number (0-100) running through the CENTER of that cell's column.
+4. Determine the Red Line number where the Item Names column (the leftmost column with item names like "Ice Breath", "Pink Petrol") ENDS — i.e. where the data columns begin.
 
-If the day numbers are missing or unreadable, say so in the note field.
+CRITICAL POSITIONING NOTES:
+- The Item Names column is wide (typically 30-40% of page width). The names_end_line is usually somewhere between 28 and 42.
+- The data columns split the remaining width. Column #1 (leftmost data column) center is typically around line 35-42. The rightmost column center is typically around line 90-96. Do not assume the answer is in the right half of the page — today's date may be in the FIRST data column.
+- The date numbers are HANDWRITTEN. Ignore any printed "DATE" labels above them; they are placeholders.
+- If the target day appears in column #1 (leftmost), expect target_col_center_line to be in the 33-44 range. If it's the last column, expect 88-96.
 
-Respond ONLY in JSON: {"target_date": "YYYY-MM-DD", "expected_header": "string (the day number you found, e.g. '7')", "names_end_line": 22, "target_col_center_line": 74, "note": ""}"""
+If you cannot read the target day on the sheet, set "found": false and explain in "note".
+
+Respond ONLY in JSON, no prose, no markdown:
+{
+  "target_date": "YYYY-MM-DD",
+  "expected_header": "string (the handwritten day number you found, e.g. '7')",
+  "found": true,
+  "names_end_line": <integer 0-100>,
+  "target_col_center_line": <integer 0-100>,
+  "note": "string (any caveats; explanation if found=false)"
+}"""
 
     with open(expected_path, "rb") as f:
         exp_bytes = f.read()
@@ -249,13 +244,10 @@ Respond ONLY in JSON: {"target_date": "YYYY-MM-DD", "expected_header": "string (
 
 
 def apply_precision_crop(input_pdf_path: str, output_pdf_path: str, col_info: dict):
-    names_end = col_info.get("names_end_line", 22) / 100.0
-    center = col_info.get("target_col_center_line", 74) / 100.0
-    # Wider window for narrower columns. With an 8-day sheet, each column is
-    # ~8% of page width — a 12% window (6% each side) gives skew tolerance
-    # while still excluding adjacent columns. With a 10-day sheet use 0.05.
-    # With a 14-day sheet (very narrow columns) use 0.03.
-    target_start, target_end = center - 0.06, center + 0.06
+    names_end = col_info.get("names_end_line", 30) / 100.0
+    center = col_info.get("target_col_center_line", 38) / 100.0
+    target_start = max(names_end, center - CROP_HALF_WIDTH)
+    target_end = min(1.0, center + CROP_HALF_WIDTH)
 
     src_doc = fitz.open(input_pdf_path)
     out_doc = fitz.open()
@@ -282,7 +274,6 @@ def apply_precision_crop(input_pdf_path: str, output_pdf_path: str, col_info: di
 
 
 def render_pdf_first_page_png(pdf_path: str) -> bytes:
-    """Render page 1 of a PDF as PNG bytes — for showing the crop preview to the user."""
     doc = fitz.open(pdf_path)
     page = doc[0]
     pix = page.get_pixmap(dpi=120)
@@ -292,7 +283,7 @@ def render_pdf_first_page_png(pdf_path: str) -> bytes:
 
 
 # ============================================================================
-# Audit prompt — text expected + cropped image
+# Audit prompt
 # ============================================================================
 def build_audit_prompt(expected_text: str, target_date: str) -> str:
     return f"""You are an inventory auditor. Today's target date is {target_date}.
@@ -376,17 +367,9 @@ def run_claude(expected_text, target_date, cropped_path):
 
 
 # ============================================================================
-# Ensemble with status tracking and adaptive consensus
-# ============================================================================
-# Ensemble with status tracking and adaptive consensus
-# ----------------------------------------------------------------------------
-# Optional `progress_callback(name, status, elapsed_sec)` is called as each
-# model starts and finishes, so the UI can show live progress. status is one
-# of "started", "ok", or an error string.
+# Ensemble
 # ============================================================================
 def ensemble_audit(expected_text, target_date, cropped_path, progress_callback=None):
-    import time
-
     runners = {
         "gemini": run_gemini,
         "openai": run_openai,
@@ -402,9 +385,8 @@ def ensemble_audit(expected_text, target_date, cropped_path, progress_callback=N
             try:
                 progress_callback(name, status, elapsed)
             except Exception:
-                pass  # Never let UI errors break the audit
+                pass
 
-    # Wrap each runner so we can fire "started" the moment the thread begins
     def make_wrapped(name, fn):
         def wrapped(*args, **kwargs):
             start_times[name] = time.time()
@@ -490,14 +472,7 @@ def ensemble_audit(expected_text, target_date, cropped_path, progress_callback=N
 
 
 # ============================================================================
-# Streamlit UI — multi-step flow with crop preview gate
-# ----------------------------------------------------------------------------
-# Streamlit reruns the whole script on every interaction, so multi-step flows
-# need session_state. The flow is:
-#   IDLE       → user uploads files, clicks "Prepare audit"
-#   PREVIEW    → surveyor + crop done, preview shown, user confirms or aborts
-#   AUDITING   → ensemble runs (during this step the spinner blocks)
-#   DONE       → results shown
+# Streamlit UI
 # ============================================================================
 st.set_page_config(page_title="Inventory Agent Pro", page_icon="🕵️‍♂️", layout="centered")
 st.title("🕵️‍♂️ Inventory Agent Pro")
@@ -506,17 +481,16 @@ st.markdown("Powered by Multi-Model Consensus (Gemini + GPT-4o + Claude)")
 if not GEMINI_API_KEY or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
     st.error("⚠️ Missing API Keys! Please configure Streamlit Secrets.")
 
-# Initialize session state
 if "stage" not in st.session_state:
     st.session_state.stage = "IDLE"
 for k in ("exp_path", "act_path", "crop_path", "col_info", "expected_items",
-          "expected_text", "target_date", "preview_png", "audit_result"):
+          "expected_text", "target_date", "preview_png", "audit_result",
+          "surveyor_warning"):
     if k not in st.session_state:
         st.session_state[k] = None
 
 
 def reset_session():
-    """Clean up temp files and reset state."""
     for k in ("exp_path", "act_path", "crop_path"):
         path = st.session_state.get(k)
         if path and os.path.exists(path):
@@ -525,12 +499,13 @@ def reset_session():
             except OSError:
                 pass
     for k in ("exp_path", "act_path", "crop_path", "col_info", "expected_items",
-              "expected_text", "target_date", "preview_png", "audit_result"):
+              "expected_text", "target_date", "preview_png", "audit_result",
+              "surveyor_warning"):
         st.session_state[k] = None
     st.session_state.stage = "IDLE"
 
 
-# ----- Stage 1: Upload -----
+# ----- Stage 1: Upload + prepare -----
 if st.session_state.stage == "IDLE":
     col1, col2 = st.columns(2)
     with col1:
@@ -544,7 +519,6 @@ if st.session_state.stage == "IDLE":
         else:
             try:
                 with st.status("Preparing audit...", expanded=True) as status:
-                    # Save uploads to disk
                     st.write("📥 Saving uploaded files...")
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as exp_tmp:
                         exp_tmp.write(expected_file.getvalue())
@@ -553,7 +527,6 @@ if st.session_state.stage == "IDLE":
                         act_tmp.write(actual_file.getvalue())
                         st.session_state.act_path = act_tmp.name
 
-                    # Pre-extract expected items from typed PDF as text
                     st.write("📄 Extracting items from expected PDF (no AI required)...")
                     items, _header = extract_expected_items(st.session_state.exp_path)
                     if not items:
@@ -567,7 +540,6 @@ if st.session_state.stage == "IDLE":
                     st.write(f"✅ Extracted {len(items)} items across "
                              f"{len({it['category'] for it in items})} categories.")
 
-                    # Surveyor pass — find the target column on actual sheet
                     st.write("🔍 Locating today's column on the actual sheet (Gemini surveyor)...")
                     client = genai.Client(api_key=GEMINI_API_KEY)
                     col_info = locate_target_column(
@@ -579,13 +551,48 @@ if st.session_state.stage == "IDLE":
                                  "Verify the date matches the expected PDF and try again.")
                         reset_session()
                         st.stop()
+
+                    if col_info.get("found") is False:
+                        status.update(label="Failed", state="error", expanded=True)
+                        st.error(f"Surveyor could not find the target date on the actual sheet: "
+                                 f"{col_info.get('note', 'no explanation')}. "
+                                 f"Verify the day numbers are clearly written in the date row.")
+                        reset_session()
+                        st.stop()
+
                     st.session_state.col_info = col_info
                     st.session_state.target_date = col_info.get("target_date", "Unknown Date")
+
+                    surveyor_warning = None
+                    target_dt = col_info.get("target_date", "")
+                    if target_dt:
+                        try:
+                            day_from_date = int(target_dt.split("-")[-1])
+                            day_from_header = int(str(col_info.get("expected_header", "")).strip())
+                            if day_from_date != day_from_header:
+                                surveyor_warning = (
+                                    f"⚠️ Target date is day {day_from_date} of the month, "
+                                    f"but the surveyor identified the column with header '{day_from_header}'. "
+                                    f"Verify the crop preview carefully before running the audit."
+                                )
+                        except (ValueError, AttributeError, IndexError):
+                            pass
+
+                    center = col_info.get("target_col_center_line", 0)
+                    names_end = col_info.get("names_end_line", 0)
+                    if center < names_end + 2 or center > 98:
+                        coord_warn = (
+                            f"⚠️ Surveyor returned an out-of-range coordinate "
+                            f"(center={center}, names_end={names_end}). "
+                            f"The crop is likely wrong — abort and re-scan."
+                        )
+                        surveyor_warning = (surveyor_warning + "\n" + coord_warn) if surveyor_warning else coord_warn
+
+                    st.session_state.surveyor_warning = surveyor_warning
                     st.write(f"✅ Target date: **{st.session_state.target_date}** · "
-                             f"column center at line {col_info.get('target_col_center_line')} · "
+                             f"column center at line {center} · "
                              f"header reads '{col_info.get('expected_header')}'.")
 
-                    # Apply the crop
                     st.write("✂️ Applying precision crop (PyMuPDF)...")
                     crop_path = st.session_state.act_path.replace(".pdf", "_cropped.pdf")
                     apply_precision_crop(
@@ -593,7 +600,6 @@ if st.session_state.stage == "IDLE":
                     )
                     st.session_state.crop_path = crop_path
 
-                    # Render page 1 of the crop as a preview image
                     st.write("🖼️ Rendering preview...")
                     st.session_state.preview_png = render_pdf_first_page_png(crop_path)
 
@@ -618,15 +624,22 @@ elif st.session_state.stage == "PREVIEW":
         f"(header reads '{st.session_state.col_info.get('expected_header')}')."
     )
 
+    if st.session_state.surveyor_warning:
+        st.warning(st.session_state.surveyor_warning)
+
     st.markdown(
         "**Verify the crop below.** The right side should show only the target date's "
-        "column. If it looks misaligned (clipped numbers, wrong day), abort and re-run."
+        "column and have visible numbers in it. If it looks misaligned (clipped numbers, "
+        "wrong day, or empty when the actual sheet has values), abort and re-run."
     )
-    st.image(st.session_state.preview_png, caption="Page 1 of cropped actual sheet", use_container_width=True)
+    st.image(st.session_state.preview_png,
+             caption="Page 1 of cropped actual sheet",
+             use_container_width=True)
 
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("✅ Crop looks correct — Run audit", type="primary", use_container_width=True):
+        if st.button("✅ Crop looks correct — Run audit",
+                     type="primary", use_container_width=True):
             st.session_state.stage = "AUDITING"
             st.rerun()
     with col_b:
@@ -639,35 +652,25 @@ elif st.session_state.stage == "PREVIEW":
 elif st.session_state.stage == "AUDITING":
     st.subheader(f"Auditing — {st.session_state.target_date}")
 
-    # Reserve a placeholder per model and one for the overall progress bar.
-    # Streamlit lets us update these from inside the callback while
-    # ensemble_audit() is still running on the main thread.
     overall_label = st.empty()
     overall_bar = st.progress(0)
-    st.write("")  # spacer
+    st.write("")
     st.caption("Models")
 
     model_names = ("gemini", "openai", "claude")
     model_display = {"gemini": "Gemini 2.5 Pro", "openai": "GPT-4o", "claude": "Claude Opus 4.7"}
     model_placeholders = {name: st.empty() for name in model_names}
 
-    # Initial render — all models pending
     for name in model_names:
-        model_placeholders[name].markdown(
-            f"⚪ **{model_display[name]}** — waiting"
-        )
+        model_placeholders[name].markdown(f"⚪ **{model_display[name]}** — waiting")
     overall_label.markdown("**Overall progress** — 0 of 3 models done")
 
-    # Track completion state across the parallel runs
     progress_state = {"completed": 0, "started": set()}
 
     def progress_callback(name, status, elapsed):
-        # Called from worker threads as each model starts/finishes.
         if status == "started":
             progress_state["started"].add(name)
-            model_placeholders[name].markdown(
-                f"🟡 **{model_display[name]}** — running..."
-            )
+            model_placeholders[name].markdown(f"🟡 **{model_display[name]}** — running...")
         elif status == "ok":
             progress_state["completed"] += 1
             done = progress_state["completed"]
@@ -678,11 +681,9 @@ elif st.session_state.stage == "AUDITING":
             overall_label.markdown(f"**Overall progress** — {done} of 3 models done")
             overall_bar.progress(done / 3)
         else:
-            # Error or timeout
             progress_state["completed"] += 1
             done = progress_state["completed"]
             elapsed_str = f"{elapsed:.1f}s" if elapsed is not None else "—"
-            # Truncate very long error messages
             short = status if len(status) <= 70 else status[:67] + "..."
             model_placeholders[name].markdown(
                 f"❌ **{model_display[name]}** — failed ({elapsed_str}): `{short}`"
@@ -697,7 +698,6 @@ elif st.session_state.stage == "AUDITING":
             st.session_state.crop_path,
             progress_callback=progress_callback,
         )
-        # Final tick — make sure the bar shows 100% even if a model errored
         overall_bar.progress(1.0)
         overall_label.markdown("**Overall progress** — tallying votes...")
 
@@ -718,7 +718,6 @@ elif st.session_state.stage == "DONE":
     result = st.session_state.audit_result
     target_date = st.session_state.target_date
 
-    # Per-model status
     status_lines = []
     for name, status in result["model_status"].items():
         icon = "✅" if status == "ok" else "❌"
