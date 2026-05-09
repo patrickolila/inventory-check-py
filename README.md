@@ -65,6 +65,32 @@ Handwriting recognition is the single hardest part of this pipeline. A single mo
 
 The cost is roughly 3x the API spend of a single-model setup. The accuracy gain is significant on real-world scanned handwriting.
 
+### The math behind it
+
+The reason this works comes from the statistics of variance. **Variance** measures how "spread out" a set of measurements is from their average — when the same quantity is measured multiple times by different methods, low variance across the methods means they all agree (high confidence), and high variance means they disagree (low confidence, likely error).
+
+The formula for sample variance is:
+
+$$S^2 = \frac{\sum_{i=1}^{N}(X_i - \bar{X})^2}{N - 1}$$
+
+Where:
+
+- **$S^2$ (Sample Variance)** — the final number representing the spread of the sample.
+- **$\sum$ (Sigma)** — the mathematical symbol for "sum." Add up everything that comes after it.
+- **$X_i$** — an individual data point in the set.
+- **$\bar{X}$ (X-bar)** — the mean (average) of the sample.
+- **$(X_i - \bar{X})^2$** — the core of the formula. Take a data point, subtract the average, square the result. Squaring serves two purposes: it makes all negative differences positive (so they don't cancel out), and it penalizes points that are far from the average more heavily than points that are close.
+- **$N$** — the total number of data points.
+- **$N - 1$** — the denominator. Subtracting 1 is a statistical adjustment called **Bessel's Correction**. Because we're only looking at a sample (a small piece of a larger population) rather than the full population, the sample's spread will usually be slightly smaller than the real-world spread. Dividing by $N - 1$ instead of $N$ corrects this bias and makes the estimate more accurate.
+
+### How this maps onto handwriting recognition
+
+Each model's reading of a handwritten cell is one $X_i$ — one data point in the sample. For a cell where the digit is clearly written, all three models read the same number, the variance is zero, and we can trust the result. For a cell where the digit is ambiguous (a smudged 3 that could be an 8, or a 1 with no foot that could be a 7), the three models tend to scatter their guesses, the variance jumps, and the disagreement itself becomes a signal that this cell needs attention.
+
+The 2-of-3 consensus rule operationalizes this: any finding where at least two models converge on the same answer has low variance and gets reported. Findings where all three disagree (high variance) get filtered out automatically — they're the ones most likely to be wrong, and silently dropping them prevents false alarms.
+
+This is why three models work better than one: a single model has a fixed error rate on hard cells, and you have no way to know when it's wrong. Three independent models with three different training datasets and three different vision encoders rarely produce the *same* wrong answer on the same cell. So consensus is much more likely on correct readings than on mistaken ones. Variance becomes the silent quality filter.
+
 ## Why the precision crop
 
 Earlier versions told the model "use column 8 of 14" and hoped it could count narrow columns across a skewed scan. That failed often — column drift was the most persistent bug.
