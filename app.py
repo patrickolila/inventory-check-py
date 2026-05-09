@@ -360,7 +360,15 @@ def run_claude(expected_text, target_date, cropped_path):
 # ============================================================================
 # Ensemble with status tracking and adaptive consensus
 # ============================================================================
-def ensemble_audit(expected_text, target_date, cropped_path):
+# Ensemble with status tracking and adaptive consensus
+# ----------------------------------------------------------------------------
+# Optional `progress_callback(name, status, elapsed_sec)` is called as each
+# model starts and finishes, so the UI can show live progress. status is one
+# of "started", "ok", or an error string.
+# ============================================================================
+def ensemble_audit(expected_text, target_date, cropped_path, progress_callback=None):
+    import time
+
     runners = {
         "gemini": run_gemini,
         "openai": run_openai,
@@ -369,22 +377,44 @@ def ensemble_audit(expected_text, target_date, cropped_path):
 
     model_results = {}
     model_status = {}
+    start_times = {}
+
+    def fire(name, status, elapsed=None):
+        if progress_callback is not None:
+            try:
+                progress_callback(name, status, elapsed)
+            except Exception:
+                pass  # Never let UI errors break the audit
+
+    # Wrap each runner so we can fire "started" the moment the thread begins
+    def make_wrapped(name, fn):
+        def wrapped(*args, **kwargs):
+            start_times[name] = time.time()
+            fire(name, "started", 0.0)
+            return fn(*args, **kwargs)
+        return wrapped
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(fn, expected_text, target_date, cropped_path): name
+            executor.submit(make_wrapped(name, fn), expected_text, target_date, cropped_path): name
             for name, fn in runners.items()
         }
         for future in concurrent.futures.as_completed(futures):
             name = futures[future]
+            elapsed = time.time() - start_times.get(name, time.time())
             try:
                 items = future.result(timeout=MODEL_TIMEOUT_SECONDS)
                 model_results[name] = items if isinstance(items, list) else []
                 model_status[name] = "ok"
+                fire(name, "ok", elapsed)
             except concurrent.futures.TimeoutError:
-                model_status[name] = f"timeout after {MODEL_TIMEOUT_SECONDS}s"
+                msg = f"timeout after {MODEL_TIMEOUT_SECONDS}s"
+                model_status[name] = msg
+                fire(name, msg, elapsed)
             except Exception as e:
-                model_status[name] = f"{type(e).__name__}: {e}"
+                msg = f"{type(e).__name__}: {e}"
+                model_status[name] = msg
+                fire(name, msg, elapsed)
 
     models_responded = len(model_results)
 
@@ -495,8 +525,9 @@ if st.session_state.stage == "IDLE":
             st.error("Please upload both PDFs!")
         else:
             try:
-                with st.spinner("Extracting expected items + locating target column..."):
+                with st.status("Preparing audit...", expanded=True) as status:
                     # Save uploads to disk
+                    st.write("📥 Saving uploaded files...")
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as exp_tmp:
                         exp_tmp.write(expected_file.getvalue())
                         st.session_state.exp_path = exp_tmp.name
@@ -505,29 +536,39 @@ if st.session_state.stage == "IDLE":
                         st.session_state.act_path = act_tmp.name
 
                     # Pre-extract expected items from typed PDF as text
+                    st.write("📄 Extracting items from expected PDF (no AI required)...")
                     items, _header = extract_expected_items(st.session_state.exp_path)
                     if not items:
+                        status.update(label="Failed", state="error", expanded=True)
                         st.error("Could not extract any items from the expected PDF. "
                                  "Check that it's the typed master list, not a scan.")
                         reset_session()
                         st.stop()
                     st.session_state.expected_items = items
                     st.session_state.expected_text = format_expected_for_prompt(items)
+                    st.write(f"✅ Extracted {len(items)} items across "
+                             f"{len({it['category'] for it in items})} categories.")
 
                     # Surveyor pass — find the target column on actual sheet
+                    st.write("🔍 Locating today's column on the actual sheet (Gemini surveyor)...")
                     client = genai.Client(api_key=GEMINI_API_KEY)
                     col_info = locate_target_column(
                         client, st.session_state.exp_path, st.session_state.act_path
                     )
                     if not col_info or "target_col_center_line" not in col_info:
+                        status.update(label="Failed", state="error", expanded=True)
                         st.error("Could not locate target column on the actual sheet. "
                                  "Verify the date matches the expected PDF and try again.")
                         reset_session()
                         st.stop()
                     st.session_state.col_info = col_info
                     st.session_state.target_date = col_info.get("target_date", "Unknown Date")
+                    st.write(f"✅ Target date: **{st.session_state.target_date}** · "
+                             f"column center at line {col_info.get('target_col_center_line')} · "
+                             f"header reads '{col_info.get('expected_header')}'.")
 
                     # Apply the crop
+                    st.write("✂️ Applying precision crop (PyMuPDF)...")
                     crop_path = st.session_state.act_path.replace(".pdf", "_cropped.pdf")
                     apply_precision_crop(
                         st.session_state.act_path, crop_path, col_info
@@ -535,7 +576,10 @@ if st.session_state.stage == "IDLE":
                     st.session_state.crop_path = crop_path
 
                     # Render page 1 of the crop as a preview image
+                    st.write("🖼️ Rendering preview...")
                     st.session_state.preview_png = render_pdf_first_page_png(crop_path)
+
+                    status.update(label="Ready for verification", state="complete", expanded=False)
 
                 st.session_state.stage = "PREVIEW"
                 st.rerun()
@@ -573,15 +617,72 @@ elif st.session_state.stage == "PREVIEW":
             st.rerun()
 
 
-# ----- Stage 3: Run the ensemble audit -----
+# ----- Stage 3: Run the ensemble audit (with live progress) -----
 elif st.session_state.stage == "AUDITING":
-    try:
-        with st.spinner("Querying Gemini, GPT-4o, and Claude in parallel..."):
-            result = ensemble_audit(
-                st.session_state.expected_text,
-                st.session_state.target_date,
-                st.session_state.crop_path,
+    st.subheader(f"Auditing — {st.session_state.target_date}")
+
+    # Reserve a placeholder per model and one for the overall progress bar.
+    # Streamlit lets us update these from inside the callback while
+    # ensemble_audit() is still running on the main thread.
+    overall_label = st.empty()
+    overall_bar = st.progress(0)
+    st.write("")  # spacer
+    st.caption("Models")
+
+    model_names = ("gemini", "openai", "claude")
+    model_display = {"gemini": "Gemini 2.5 Pro", "openai": "GPT-4o", "claude": "Claude Opus 4.7"}
+    model_placeholders = {name: st.empty() for name in model_names}
+
+    # Initial render — all models pending
+    for name in model_names:
+        model_placeholders[name].markdown(
+            f"⚪ **{model_display[name]}** — waiting"
+        )
+    overall_label.markdown("**Overall progress** — 0 of 3 models done")
+
+    # Track completion state across the parallel runs
+    progress_state = {"completed": 0, "started": set()}
+
+    def progress_callback(name, status, elapsed):
+        # Called from worker threads as each model starts/finishes.
+        if status == "started":
+            progress_state["started"].add(name)
+            model_placeholders[name].markdown(
+                f"🟡 **{model_display[name]}** — running..."
             )
+        elif status == "ok":
+            progress_state["completed"] += 1
+            done = progress_state["completed"]
+            elapsed_str = f"{elapsed:.1f}s" if elapsed is not None else "—"
+            model_placeholders[name].markdown(
+                f"✅ **{model_display[name]}** — done ({elapsed_str})"
+            )
+            overall_label.markdown(f"**Overall progress** — {done} of 3 models done")
+            overall_bar.progress(done / 3)
+        else:
+            # Error or timeout
+            progress_state["completed"] += 1
+            done = progress_state["completed"]
+            elapsed_str = f"{elapsed:.1f}s" if elapsed is not None else "—"
+            # Truncate very long error messages
+            short = status if len(status) <= 70 else status[:67] + "..."
+            model_placeholders[name].markdown(
+                f"❌ **{model_display[name]}** — failed ({elapsed_str}): `{short}`"
+            )
+            overall_label.markdown(f"**Overall progress** — {done} of 3 models done")
+            overall_bar.progress(done / 3)
+
+    try:
+        result = ensemble_audit(
+            st.session_state.expected_text,
+            st.session_state.target_date,
+            st.session_state.crop_path,
+            progress_callback=progress_callback,
+        )
+        # Final tick — make sure the bar shows 100% even if a model errored
+        overall_bar.progress(1.0)
+        overall_label.markdown("**Overall progress** — tallying votes...")
+
         st.session_state.audit_result = result
         st.session_state.stage = "DONE"
         st.rerun()
