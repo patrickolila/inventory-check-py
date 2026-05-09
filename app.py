@@ -1083,6 +1083,39 @@ elif st.session_state.stage == "DONE":
         st.warning("Only 2 of 3 models responded in round 1. Showing items both remaining models agreed on.")
 
     discrepancies = result["discrepancies"]
+
+    # Format the target date nicely for the WhatsApp message
+    # "2026-05-07" -> "May 7, 2026"
+    try:
+        from datetime import datetime
+        date_pretty = datetime.strptime(target_date, "%Y-%m-%d").strftime("%b %d, %Y")
+    except (ValueError, TypeError):
+        date_pretty = target_date
+
+    # Always build a WhatsApp message — discrepancies OR all-match
+    if discrepancies:
+        wa_lines = [f"Inventory Check — {date_pretty}",
+                    f"{len(discrepancies)} discrepanc{'y' if len(discrepancies)==1 else 'ies'} found",
+                    ""]
+        # Group by category if items have one (they don't currently in this codepath,
+        # but the formatting is robust to flat lists)
+        for d in discrepancies:
+            wa_lines.append(
+                f"- {d['item']}: actual {d['actual']}, "
+                f"expected {d['expected']} (variance {d['difference']:+d})"
+            )
+        whatsapp_message = "\n".join(wa_lines)
+    else:
+        # Match the format of the actual sheet's "all match" days
+        # Count comes from the expected items in session, since the audit only
+        # returns discrepancies — total items checked is everyone in the master list.
+        total_items = len(st.session_state.expected_items or [])
+        whatsapp_message = (
+            f"Inventory Check — {date_pretty}\n"
+            f"✅ All {total_items} items match."
+        )
+
+    # === RESULTS DISPLAY ===
     if not discrepancies and responded > 0:
         st.success("Consensus reached.")
         st.balloons()
@@ -1112,17 +1145,16 @@ elif st.session_state.stage == "DONE":
                 f"expected {d['expected']} (variance {d['difference']:+d}){confidence_label}"
             )
 
-        # WhatsApp-formatted report (no confidence — keeps the message clean)
-        st.markdown("**WhatsApp-formatted message:**")
-        report_text = f"Inventory Discrepancies — {target_date}\n\n"
-        for d in discrepancies:
-            report_text += (
-                f"- {d['item']}: actual {d['actual']}, "
-                f"expected {d['expected']} (variance {d['difference']:+d})\n"
-            )
-        st.code(report_text, language="text")
+    # === WHATSAPP MESSAGE — always rendered when audit succeeded ===
+    if responded > 0:
+        st.markdown("---")
+        st.markdown("### 📱 WhatsApp Message")
+        st.caption("Click the copy icon in the top-right of the box below, then paste into WhatsApp.")
+        st.code(whatsapp_message, language="text")
 
-        # Math explanation panel
+    # === MATH EXPLANATION (only when there are discrepancies, since that's
+    # when the confidence scores actually appear in the output) ===
+    if discrepancies:
         with st.expander("📊 How is confidence calculated?"):
             st.markdown("""
 **Two-round sampling with weighted majority voting.**
