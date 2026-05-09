@@ -157,13 +157,44 @@ def extract_expected_items(pdf_path: str):
         m = item_pattern.match(ln)
         if m and m.group(2):
             name_raw = m.group(1).rstrip()
-            qty = int(m.group(2))
-            if name_raw:
-                items.append({
-                    "name": name_raw,
-                    "qty": qty,
-                    "category": current_category,
-                })
+            qty_str = m.group(2)
+            qty = int(qty_str)
+            if not name_raw:
+                continue
+
+            # Detect pypdf extraction glitches where a character of the name
+            # got glued to the quantity. The signature is:
+            #   - No whitespace separator between name and quantity, AND
+            #   - Quantity is implausibly large (>= 30) for a glued-letter
+            #     parse to be the real qty
+            # Why both conditions? pypdf often drops the space between name
+            # and qty even when the parse is correct (e.g. "Raspberry3" really
+            # is qty 3). But when the qty is large AND glued, it's almost
+            # certainly a lost-character glitch like "Confectionary 0" being
+            # mangled to "Confectionar70" (the "y" got absorbed into "70").
+            # We default to qty=0 to avoid false discrepancies and surface
+            # the suspicious item to the user.
+            suspicious_reason = None
+            full_match_end_of_name_idx = m.start(2)
+            char_before_qty = ln[full_match_end_of_name_idx - 1] if full_match_end_of_name_idx > 0 else ""
+            glued_to_letter = char_before_qty.isalpha()
+
+            if glued_to_letter and qty >= 30:
+                suspicious_reason = (
+                    f"name '{name_raw}' has no space before quantity '{qty_str}' "
+                    f"and qty is implausibly large — pypdf may have lost a character "
+                    f"(parsed qty defaulted to 0)"
+                )
+
+            entry = {
+                "name": name_raw,
+                "qty": 0 if suspicious_reason else qty,
+                "category": current_category,
+            }
+            if suspicious_reason:
+                entry["suspicious"] = suspicious_reason
+                entry["raw_qty"] = qty
+            items.append(entry)
 
     return items, header_text
 
@@ -539,6 +570,19 @@ if st.session_state.stage == "IDLE":
                     st.session_state.expected_text = format_expected_for_prompt(items)
                     st.write(f"✅ Extracted {len(items)} items across "
                              f"{len({it['category'] for it in items})} categories.")
+
+                    # Surface any suspicious extractions (likely pypdf parse glitches)
+                    suspicious = [it for it in items if it.get("suspicious")]
+                    if suspicious:
+                        st.warning(
+                            f"⚠️ {len(suspicious)} item(s) had suspicious quantities and "
+                            f"were defaulted to 0 to avoid false discrepancies:"
+                        )
+                        for it in suspicious:
+                            st.write(
+                                f"  • **{it['name']}** — parsed qty `{it['raw_qty']}` "
+                                f"({it['suspicious']})"
+                            )
 
                     st.write("🔍 Locating today's column on the actual sheet (Gemini surveyor)...")
                     client = genai.Client(api_key=GEMINI_API_KEY)
